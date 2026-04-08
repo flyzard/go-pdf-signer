@@ -1,2 +1,8 @@
 *.pdf
 *.der
+/cache
+/project.local.yml
+.serena/
+internal/.DS_Store
+**/.DS_Store
+bin
