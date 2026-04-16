@@ -35,6 +35,9 @@ func FetchCRL(cert *x509.Certificate) (*CRLResult, error) {
 }
 
 func fetchCRL(client *http.Client, url string) ([]byte, error) {
+	if err := validateFetchURL(url); err != nil {
+		return nil, fmt.Errorf("unsafe CRL URL %s: %w", url, err)
+	}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("fetching CRL from %s: %w", url, err)

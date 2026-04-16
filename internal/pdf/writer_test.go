@@ -126,3 +126,81 @@ func TestUpdateCatalog(t *testing.T) {
 		t.Errorf("/DSS ref = %d, want %d", gotRef.Number, dssRef.Number)
 	}
 }
+
+
+// TestTrailerSizeCoversAllObjects verifies that the trailer /Size is 1 greater
+// than the highest object number, including the catalog object added by UpdateCatalog.
+func TestTrailerSizeCoversAllObjects(t *testing.T) {
+	srcPath := createTestPDF(t)
+	doc, err := Open(srcPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	w := NewWriter(doc)
+	// Add two objects: they get numbers 4 and 5 (test PDF has Size=4).
+	w.AddObject(Dict{"Type": Name("Test1")})
+	w.AddObject(Dict{"Type": Name("Test2")})
+
+	// Update catalog — this adds a catalog object (number 6).
+	w.UpdateCatalog(func(cat Dict) Dict {
+		cat["TestKey"] = Name("TestValue")
+		return cat
+	})
+
+	outBytes, err := w.WriteToBytes()
+	if err != nil {
+		t.Fatalf("WriteToBytes: %v", err)
+	}
+
+	outDoc, err := Parse(outBytes)
+	if err != nil {
+		t.Fatalf("re-parse: %v", err)
+	}
+
+	// The catalog should be object 6. Size must be >= 7 to cover it.
+	rootRef := outDoc.CatalogRef
+	expectedMinSize := rootRef.Number + 1
+	actualSize := outDoc.NextObjNum // NextObjNum is set from trailer /Size
+
+	if actualSize < expectedMinSize {
+		t.Errorf("trailer /Size = %d, but catalog is object %d — Size must be >= %d",
+			actualSize, rootRef.Number, expectedMinSize)
+	}
+
+	// Verify the catalog object is accessible via xref.
+	if _, ok := outDoc.XRef[rootRef.Number]; !ok {
+		t.Errorf("catalog object %d not found in xref", rootRef.Number)
+	}
+}
+
+// TestBuildBytesIdempotent verifies that WriteToBytes produces identical results on successive calls.
+func TestBuildBytesIdempotent(t *testing.T) {
+	srcPath := createTestPDF(t)
+	doc, err := Open(srcPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	w := NewWriter(doc)
+	w.AddObject(Dict{"Type": Name("Test1")})
+
+	w.UpdateCatalog(func(cat Dict) Dict {
+		cat["TestKey"] = Name("TestValue")
+		return cat
+	})
+
+	first, err := w.WriteToBytes()
+	if err != nil {
+		t.Fatalf("first WriteToBytes: %v", err)
+	}
+
+	second, err := w.WriteToBytes()
+	if err != nil {
+		t.Fatalf("second WriteToBytes: %v", err)
+	}
+
+	if !bytes.Equal(first, second) {
+		t.Error("WriteToBytes produced different results on second call — buildBytes is not idempotent")
+	}
+}

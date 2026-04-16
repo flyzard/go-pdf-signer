@@ -356,6 +356,9 @@ func extractCertsFromCMS(cmsData []byte) ([]*x509.Certificate, error) {
 
 // isAllZeros returns true if s contains only '0' characters.
 func isAllZeros(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
 	for _, c := range s {
 		if c != '0' {
 			return false

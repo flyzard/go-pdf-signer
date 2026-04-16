@@ -15,7 +15,7 @@ type VerifyOptions struct {
 
 // VerifyResult contains the output of the verify step.
 type VerifyResult struct {
-	Valid             bool                    `json:"valid"`
+	HasSignatures     bool                    `json:"has_signatures"`
 	Signatures        []SignatureVerification `json:"signatures"`
 	DocumentTimestamp string                  `json:"document_timestamp,omitempty"`
 	LTVStatus         string                  `json:"ltv_status"`
@@ -40,24 +40,29 @@ func Verify(opts VerifyOptions) (*VerifyResult, error) {
 		return nil, fmt.Errorf("open PDF: %w", err)
 	}
 
-	_, hasDSS := doc.Catalog["DSS"]
 	ltvStatus := "none"
 	ltvValidCerts := false
+	dssVal, hasDSS := doc.Catalog["DSS"]
 	if hasDSS {
-		ltvStatus = "partial" // DSS present at minimum
-		dssRef, ok := doc.Catalog.GetRef("DSS")
-		if ok {
-			dssDict, err := doc.ReadDictObject(dssRef)
+		ltvStatus = "partial"
+		var dssDict pdf.Dict
+		switch v := dssVal.(type) {
+		case pdf.Ref:
+			d, err := doc.ReadDictObject(v)
 			if err == nil {
-				_, hasCerts := dssDict["Certs"]
-				_, hasOCSPs := dssDict["OCSPs"]
-				if hasCerts {
-					ltvValidCerts = true
-				}
-				if hasCerts && hasOCSPs {
-					ltvStatus = "valid"
-				}
-				// else: stays "partial"
+				dssDict = d
+			}
+		case pdf.Dict:
+			dssDict = v
+		}
+		if dssDict != nil {
+			_, hasCerts := dssDict["Certs"]
+			_, hasOCSPs := dssDict["OCSPs"]
+			if hasCerts {
+				ltvValidCerts = true
+			}
+			if hasCerts && hasOCSPs {
+				ltvStatus = "valid"
 			}
 		}
 	}
@@ -93,7 +98,7 @@ func Verify(opts VerifyOptions) (*VerifyResult, error) {
 		result.Signatures = append(result.Signatures, sv)
 	}
 
-	result.Valid = len(result.Signatures) > 0
+	result.HasSignatures = len(result.Signatures) > 0
 
 	return result, nil
 }

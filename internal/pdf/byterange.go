@@ -16,7 +16,7 @@ type ByteRange struct {
 }
 
 func (br ByteRange) String() string {
-	return fmt.Sprintf("[0 %d %d %d]", br.Length1, br.Offset2, br.Length2)
+	return fmt.Sprintf("[%d %d %d %d]", br.Offset1, br.Length1, br.Offset2, br.Length2)
 }
 
 // FindPlaceholder locates the signature /Contents hex placeholder in the PDF data

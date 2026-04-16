@@ -105,44 +105,25 @@ func Prepare(opts PrepareOptions) (*PrepareResult, error) {
 		return cat
 	})
 
-	// 8. Write the prepared PDF.
-	if err := w.WriteTo(opts.OutputPath); err != nil {
-		return nil, fmt.Errorf("write output PDF: %w", err)
-	}
-
-	// 9. Read the output file bytes.
-	data, err := os.ReadFile(opts.OutputPath)
+	// 8. Build the PDF bytes in memory.
+	data, err := w.WriteToBytes()
 	if err != nil {
-		return nil, fmt.Errorf("read output file: %w", err)
+		return nil, fmt.Errorf("build PDF bytes: %w", err)
 	}
 
-	// 10. Find placeholder to get ByteRange.
+	// 9. Find placeholder to get ByteRange.
 	br, err := pdf.FindPlaceholder(data)
 	if err != nil {
 		return nil, fmt.Errorf("find placeholder: %w", err)
 	}
 
-	// 11-12. Patch the ByteRange in the file.
+	// 10. Patch the ByteRange in memory.
 	data, err = patchByteRange(data, br)
 	if err != nil {
 		return nil, fmt.Errorf("patch byte range: %w", err)
 	}
 
-	// Write patched data back to file.
-	if err := os.WriteFile(opts.OutputPath, data, 0644); err != nil {
-		return nil, fmt.Errorf("write patched file: %w", err)
-	}
-
-	// 13. Re-read and re-hash with the patched ByteRange.
-	// The ByteRange values haven't changed (they describe the placeholder position,
-	// not the ByteRange string position), but the data has changed because we
-	// patched the ByteRange string itself. We must hash the final bytes.
-	data, err = os.ReadFile(opts.OutputPath)
-	if err != nil {
-		return nil, fmt.Errorf("re-read patched file: %w", err)
-	}
-
-	// Re-find placeholder (position hasn't changed, but re-verify).
+	// 11. Re-find placeholder and hash the final bytes.
 	br, err = pdf.FindPlaceholder(data)
 	if err != nil {
 		return nil, fmt.Errorf("find placeholder after patch: %w", err)
@@ -150,7 +131,12 @@ func Prepare(opts PrepareOptions) (*PrepareResult, error) {
 
 	hash := pdf.HashByteRanges(data, br)
 
-	// 14. Return result.
+	// 12. Write final result to disk once.
+	if err := os.WriteFile(opts.OutputPath, data, 0600); err != nil {
+		return nil, fmt.Errorf("write output PDF: %w", err)
+	}
+
+	// 13. Return result.
 	return &PrepareResult{
 		Hash:          base64.StdEncoding.EncodeToString(hash),
 		HashAlgorithm: "SHA-256",

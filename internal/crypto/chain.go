@@ -91,6 +91,9 @@ func BuildChain(leaf *x509.Certificate) (*ChainResult, error) {
 
 // fetchCert fetches a DER-encoded certificate from the given URL.
 func fetchCert(url string) (*x509.Certificate, error) {
+	if err := validateFetchURL(url); err != nil {
+		return nil, fmt.Errorf("unsafe URL %s: %w", url, err)
+	}
 	resp, err := httpClient10s.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("fetching cert from %s: %w", url, err)

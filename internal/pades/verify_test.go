@@ -17,8 +17,8 @@ func TestVerifyUnsignedPDF(t *testing.T) {
 		t.Fatalf("Verify returned unexpected error for unsigned PDF: %v", err)
 	}
 
-	if result.Valid {
-		t.Error("expected Valid=false for unsigned PDF")
+	if result.HasSignatures {
+		t.Error("expected HasSignatures=false for unsigned PDF")
 	}
 
 	if len(result.Signatures) != 0 {
@@ -78,8 +78,8 @@ func TestVerifySignedPDF(t *testing.T) {
 		t.Fatalf("Verify: %v", err)
 	}
 
-	if !result.Valid {
-		t.Error("expected Valid=true for signed+finalized PDF")
+	if !result.HasSignatures {
+		t.Error("expected HasSignatures=true for signed+finalized PDF")
 	}
 
 	if len(result.Signatures) == 0 {

@@ -3,6 +3,7 @@ package pdf
 import (
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -126,13 +127,19 @@ func Serialize(v any) string {
 }
 
 func serializeDict(d Dict) string {
+	keys := make([]string, 0, len(d))
+	for k := range d {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	var sb strings.Builder
 	sb.WriteString("<<")
-	for k, v := range d {
+	for _, k := range keys {
 		sb.WriteString(" /")
 		sb.WriteString(k)
 		sb.WriteString(" ")
-		sb.WriteString(Serialize(v))
+		sb.WriteString(Serialize(d[k]))
 	}
 	sb.WriteString(" >>")
 	return sb.String()

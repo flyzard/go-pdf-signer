@@ -59,6 +59,9 @@ func FetchOCSP(cert, issuer *x509.Certificate) (*OCSPResult, error) {
 }
 
 func postOCSP(client *http.Client, url string, body []byte) ([]byte, error) {
+	if err := validateFetchURL(url); err != nil {
+		return nil, fmt.Errorf("unsafe OCSP URL %s: %w", url, err)
+	}
 	resp, err := client.Post(url, "application/ocsp-request", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("POST to OCSP server %s: %w", url, err)

@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -426,5 +427,27 @@ func TestVRIKeyComputation(t *testing.T) {
 	// Verify it's uppercase.
 	if expected != strings.ToUpper(expected) {
 		t.Error("VRI key is not uppercase")
+	}
+}
+
+
+func TestIsAllZeros(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", false},
+		{"0", true},
+		{"000", true},
+		{"001", false},
+		{"abc", false},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%q", tt.input), func(t *testing.T) {
+			got := isAllZeros(tt.input)
+			if got != tt.want {
+				t.Errorf("isAllZeros(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }

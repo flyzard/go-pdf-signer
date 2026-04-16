@@ -32,7 +32,7 @@ func Embed(opts EmbedOptions) error {
 		return fmt.Errorf("embed CMS: %w", err)
 	}
 
-	if err := os.WriteFile(opts.OutputPath, signedData, 0644); err != nil {
+	if err := os.WriteFile(opts.OutputPath, signedData, 0600); err != nil {
 		return fmt.Errorf("write output PDF: %w", err)
 	}
 

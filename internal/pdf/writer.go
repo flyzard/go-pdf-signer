@@ -154,7 +154,7 @@ func (w *Writer) WriteTo(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 // WriteToBytes is a convenience wrapper that returns the complete updated PDF
@@ -164,6 +164,10 @@ func (w *Writer) WriteToBytes() ([]byte, error) {
 }
 
 func (w *Writer) buildBytes() ([]byte, error) {
+	// Save the state of nextObjNum so we can restore it after building,
+	// ensuring buildBytes is idempotent (multiple calls produce the same output).
+	savedNextObjNum := w.nextObjNum
+
 	// Determine the root reference for the new trailer.
 	rootRef := w.doc.CatalogRef
 
@@ -181,7 +185,22 @@ func (w *Writer) buildBytes() ([]byte, error) {
 	}
 
 	// Combine all objects in order.
-	allObjects := append(pendingObjects, extraObjects...)
+	allObjects := make([]writtenObject, 0, len(pendingObjects)+len(extraObjects))
+	allObjects = append(allObjects, pendingObjects...)
+	allObjects = append(allObjects, extraObjects...)
+
+	// Compute the correct /Size: 1 greater than the highest object number in
+	// the entire file (across all incremental updates).
+	// Start from the original file's Size (which covers all prior objects).
+	size := savedNextObjNum
+	for _, wo := range allObjects {
+		if wo.ref.Number+1 > size {
+			size = wo.ref.Number + 1
+		}
+	}
+
+	// Restore nextObjNum so buildBytes is idempotent.
+	w.nextObjNum = savedNextObjNum
 
 	// Base offset: length of original data + 1 (for the separating "\n").
 	baseOffset := int64(len(w.doc.Data)) + 1
@@ -215,7 +234,7 @@ func (w *Writer) buildBytes() ([]byte, error) {
 
 	// Build new trailer dictionary.
 	trailerDict := Dict{
-		"Size": w.nextObjNum,
+		"Size": size,
 		"Root": rootRef,
 		"Prev": w.doc.XRefOffset,
 	}

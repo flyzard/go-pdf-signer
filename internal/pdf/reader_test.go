@@ -8,59 +8,6 @@ import (
 	"testing"
 )
 
-// createTestPDF writes a minimal valid PDF to a temp directory and returns the path.
-// Byte offsets have been hand-verified:
-//
-//	%PDF-1.7\n              => 9 bytes  (offset 0)
-//	1 0 obj\n               => 8 bytes  (offset 9)
-//	<< /Type /Catalog /Pages 2 0 R >>\n  => 34 bytes  (offset 17)
-//	endobj\n                => 7 bytes  (offset 51)
-//	2 0 obj\n               => 8 bytes  (offset 58)   ← obj2
-//	<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n => 43 bytes (offset 66)
-//	endobj\n                => 7 bytes  (offset 109) [wait — let me note actual: 58+8+43+7=116? no]
-//
-// Verified by python: obj1=9, obj2=58, obj3=115, xref=186.
-func createTestPDF(t *testing.T) string {
-	t.Helper()
-
-	// This content is byte-exact. Offsets:
-	//   obj 1 → 9
-	//   obj 2 → 58
-	//   obj 3 → 115
-	//   xref  → 186
-	// Each xref entry is exactly 20 bytes: "NNNNNNNNNN GGGGG F \n"
-	// where F is 'n' or 'f', and there is a space before \n (PDF spec requirement).
-	content := "" +
-		"%PDF-1.7\n" +
-		"1 0 obj\n" +
-		"<< /Type /Catalog /Pages 2 0 R >>\n" +
-		"endobj\n" +
-		"2 0 obj\n" +
-		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n" +
-		"endobj\n" +
-		"3 0 obj\n" +
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\n" +
-		"endobj\n" +
-		"xref\n" +
-		"0 4\n" +
-		"0000000000 65535 f \n" +
-		"0000000009 00000 n \n" +
-		"0000000058 00000 n \n" +
-		"0000000115 00000 n \n" +
-		"trailer\n" +
-		"<< /Size 4 /Root 1 0 R >>\n" +
-		"startxref\n" +
-		"186\n" +
-		"%%EOF\n"
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.pdf")
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatalf("createTestPDF: %v", err)
-	}
-	return path
-}
-
 func TestOpenPDF(t *testing.T) {
 	path := createTestPDF(t)
 
@@ -208,6 +155,22 @@ func TestSerialize(t *testing.T) {
 				t.Errorf("Serialize(%v) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSerializeDictDeterministic(t *testing.T) {
+	d := Dict{
+		"Type":  Name("Catalog"),
+		"Pages": Ref{2, 0},
+		"Size":  42,
+	}
+
+	first := Serialize(d)
+	for i := 0; i < 100; i++ {
+		got := Serialize(d)
+		if got != first {
+			t.Fatalf("non-deterministic serialization on iteration %d:\n  first: %s\n  got:   %s", i, first, got)
+		}
 	}
 }
 
