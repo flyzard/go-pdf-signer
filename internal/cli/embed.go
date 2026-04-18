@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 
 	"github.com/flyzard/pdf-signer/internal/pades"
+	"github.com/flyzard/pdf-signer/internal/pdf"
 )
 
 // RunEmbed handles the "embed" subcommand.
@@ -35,6 +37,9 @@ func RunEmbed(args []string) {
 		CMSPath:    *cms,
 	})
 	if err != nil {
+		if errors.Is(err, pdf.ErrPlaceholderTooSmall) {
+			Fatalf("PLACEHOLDER_TOO_SMALL", "CMS does not fit in signature placeholder: %v", err)
+		}
 		Fatalf("EMBED_FAILED", "embed failed: %v", err)
 	}
 

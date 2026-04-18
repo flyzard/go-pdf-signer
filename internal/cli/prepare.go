@@ -20,6 +20,7 @@ func RunPrepare(args []string) {
 	signerNIC := fs.String("signer-nic", "", "Signer NIC (optional)")
 	signingMethod := fs.String("signing-method", "cmd", "Signing method: cmd or cc")
 	sigPos := fs.String("signature-position", "", "Signature position: page,x,y,w,h (default: auto)")
+	placeholderSize := fs.Int("placeholder-size", 0, "Signature /Contents placeholder capacity in bytes (default: 16384)")
 
 	if err := fs.Parse(args); err != nil {
 		Fatalf("INVALID_ARGS", "failed to parse arguments: %v", err)
@@ -46,12 +47,13 @@ func RunPrepare(args []string) {
 	}
 
 	result, err := pades.Prepare(pades.PrepareOptions{
-		InputPath:     *input,
-		OutputPath:    *output,
-		SignerName:    *signerName,
-		SignerNIC:     *signerNIC,
-		SigningMethod: *signingMethod,
-		SignaturePos:  pos,
+		InputPath:       *input,
+		OutputPath:      *output,
+		SignerName:      *signerName,
+		SignerNIC:       *signerNIC,
+		SigningMethod:   *signingMethod,
+		SignaturePos:    pos,
+		PlaceholderSize: *placeholderSize,
 	})
 	if err != nil {
 		Fatalf("PREPARE_FAILED", "prepare failed: %v", err)

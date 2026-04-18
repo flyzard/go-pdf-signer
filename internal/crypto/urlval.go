@@ -7,8 +7,13 @@ import (
 	"strings"
 )
 
-// validateFetchURL checks that a URL is safe to fetch (HTTP/HTTPS, no private IPs).
-func validateFetchURL(rawURL string) error {
+// validateFetchURL is the active URL validator. Tests may swap it via
+// allowLoopbackForTest() in testhook_test.go. Production code path is
+// validateFetchURLDefault.
+var validateFetchURL = validateFetchURLDefault
+
+// validateFetchURLDefault checks that a URL is safe to fetch (HTTP/HTTPS, no private IPs).
+func validateFetchURLDefault(rawURL string) error {
 	if rawURL == "" {
 		return fmt.Errorf("empty URL")
 	}

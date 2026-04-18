@@ -2,20 +2,37 @@ package pdf
 
 import (
 	"fmt"
-	"os"
+	"sort"
 	"strings"
 )
 
-// PlaceholderSize is the byte capacity of the signature /Contents placeholder.
+// PlaceholderSize is the default byte capacity of the signature /Contents
+// placeholder. 16 KB comfortably fits a B-B CMS blob with a short chain and
+// leaves headroom for a B-T signature timestamp token (≈5-10 KB) injected
+// as an unsigned attribute.
 const PlaceholderSize = 16384
 
-// PlaceholderHexLen is the number of hex characters in the placeholder (2 per byte).
-const PlaceholderHexLen = PlaceholderSize * 2
+// MinPlaceholderSize is the smallest placeholder the CLI will accept via
+// --placeholder-size. Below this the placeholder-detection heuristic in
+// byterange.go may collide with regular hex literals. Chosen as 1 KB.
+const MinPlaceholderSize = 1024
 
-// SignaturePlaceholder returns the hex-encoded zero-filled Contents placeholder
-// including surrounding angle brackets, ready to embed in a PDF object.
+// MaxPlaceholderSize caps --placeholder-size to defend against accidental
+// disk-bloat or DoS when the size comes from untrusted configuration. 1 MB
+// is orders of magnitude above any legitimate PAdES-LTA CMS blob.
+const MaxPlaceholderSize = 1 << 20
+
+// SignaturePlaceholder returns the default-sized hex-encoded zero-filled
+// /Contents placeholder including surrounding angle brackets. Callers that
+// need a non-default size should use SignaturePlaceholderOfSize.
 func SignaturePlaceholder() string {
-	return "<" + strings.Repeat("0", PlaceholderHexLen) + ">"
+	return SignaturePlaceholderOfSize(PlaceholderSize)
+}
+
+// SignaturePlaceholderOfSize returns a `<0...0>` placeholder sized to hold
+// size bytes of CMS (2*size hex chars between the angle brackets).
+func SignaturePlaceholderOfSize(size int) string {
+	return "<" + strings.Repeat("0", size*2) + ">"
 }
 
 // writtenObject holds the byte offset (within the incremental section) and
@@ -27,13 +44,16 @@ type writtenObject struct {
 
 // Writer appends new objects to an existing PDF using incremental updates.
 type Writer struct {
-	doc        *Document
-	objects    []writtenObject
-	nextObjNum int
-	catalogFn  func(Dict) Dict
+	doc             *Document
+	objects         []writtenObject
+	nextObjNum      int
+	catalogFn       func(Dict) Dict
+	placeholderSize int // 0 = use PlaceholderSize default
 }
 
-// NewWriter creates a Writer that will append to doc.
+// NewWriter creates a Writer that will append to doc. Uses PlaceholderSize
+// bytes for any signature placeholder it emits; override via
+// SetPlaceholderSize.
 func NewWriter(doc *Document) *Writer {
 	return &Writer{
 		doc:        doc,
@@ -41,19 +61,35 @@ func NewWriter(doc *Document) *Writer {
 	}
 }
 
+// SetPlaceholderSize overrides the default signature placeholder capacity
+// for this Writer. Must be within [MinPlaceholderSize, MaxPlaceholderSize].
+// Passing 0 resets to the default. Returns an error if size is out of
+// range; no error when size equals the current setting.
+func (w *Writer) SetPlaceholderSize(size int) error {
+	if size == 0 {
+		w.placeholderSize = 0
+		return nil
+	}
+	if size < MinPlaceholderSize || size > MaxPlaceholderSize {
+		return fmt.Errorf("placeholder size %d out of range [%d..%d]", size, MinPlaceholderSize, MaxPlaceholderSize)
+	}
+	w.placeholderSize = size
+	return nil
+}
+
+// PlaceholderSize returns the placeholder capacity this Writer will use for
+// new signature objects.
+func (w *Writer) PlaceholderSize() int {
+	if w.placeholderSize == 0 {
+		return PlaceholderSize
+	}
+	return w.placeholderSize
+}
+
 // NextObjectNumber returns the object number that will be assigned to the next
 // object added via any Add* method.
 func (w *Writer) NextObjectNumber() int {
 	return w.nextObjNum
-}
-
-// cloneDict returns a shallow copy of d.
-func cloneDict(d Dict) Dict {
-	out := make(Dict, len(d))
-	for k, v := range d {
-		out[k] = v
-	}
-	return out
 }
 
 // allocRef consumes and returns the next object reference.
@@ -77,12 +113,22 @@ func (w *Writer) AddObject(d Dict) Ref {
 	return ref
 }
 
+// ReplaceObject re-emits an existing object (same ref number, same
+// generation) with a new dictionary body. Intended for incremental-update
+// edits of objects that already live in the base PDF — e.g. appending a
+// signature widget to a page's /Annots. The PDF reader follows the xref
+// /Prev chain bottom-up, so the most recent entry (this one) wins.
+func (w *Writer) ReplaceObject(ref Ref, d Dict) {
+	body := fmt.Sprintf("%d %d obj\n%s\nendobj\n", ref.Number, ref.Generation, Serialize(d))
+	w.addRaw(ref, []byte(body))
+}
+
 // AddStream creates a stream object whose dictionary is extraDict merged with
 // /Length, assigns the next object number, and returns its reference.
 func (w *Writer) AddStream(content []byte, extraDict Dict) Ref {
 	ref := w.allocRef()
 
-	d := cloneDict(extraDict)
+	d := extraDict.Clone()
 	d["Length"] = len(content)
 
 	var sb strings.Builder
@@ -96,14 +142,6 @@ func (w *Writer) AddStream(content []byte, extraDict Dict) Ref {
 	return ref
 }
 
-// AddRawObject stores pre-serialised object data (must include "N G obj … endobj")
-// and assigns the next object number.
-func (w *Writer) AddRawObject(data []byte) Ref {
-	ref := w.allocRef()
-	w.addRaw(ref, data)
-	return ref
-}
-
 // AddSignatureObject adds a signature dictionary object with reserved
 // /ByteRange and /Contents placeholders that can be patched in-place later.
 // Keys "Contents" and "ByteRange" in d are ignored; they are handled here.
@@ -114,11 +152,17 @@ func (w *Writer) AddSignatureObject(d Dict) Ref {
 	fmt.Fprintf(&sb, "%d %d obj\n<<", ref.Number, ref.Generation)
 
 	// Write all keys except Contents and ByteRange (handled specially below).
-	for k, v := range d {
+	// Sort keys for deterministic output.
+	keys := make([]string, 0, len(d))
+	for k := range d {
 		if k == "Contents" || k == "ByteRange" {
 			continue
 		}
-		fmt.Fprintf(&sb, " /%s %s", k, Serialize(v))
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&sb, " /%s %s", k, Serialize(d[k]))
 	}
 
 	// /ByteRange placeholder – padded to ~60 chars so real values fit.
@@ -130,9 +174,10 @@ func (w *Writer) AddSignatureObject(d Dict) Ref {
 	sb.WriteString(" ")
 	sb.WriteString(byteRangeLine)
 
-	// /Contents placeholder – exactly PlaceholderHexLen zero hex chars.
+	// /Contents placeholder – zero hex chars sized by the writer's
+	// configured placeholder capacity (default PlaceholderSize).
 	sb.WriteString(" /Contents ")
-	sb.WriteString(SignaturePlaceholder())
+	sb.WriteString(SignaturePlaceholderOfSize(w.PlaceholderSize()))
 
 	sb.WriteString(" >>\nendobj\n")
 
@@ -147,18 +192,25 @@ func (w *Writer) UpdateCatalog(fn func(Dict) Dict) {
 	w.catalogFn = fn
 }
 
-// WriteTo writes the incremental update to path (creates or truncates the file).
-// The output is: original PDF bytes + "\n" + new objects + xref + trailer.
+// WriteTo writes the incremental update to path via an atomic temp+rename so
+// a crash mid-write cannot leave a truncated output. Refuses to follow a
+// symlink at path. See WriteFileAtomic for details.
 func (w *Writer) WriteTo(path string) error {
 	data, err := w.buildBytes()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return WriteFileAtomic(path, data)
 }
 
 // WriteToBytes is a convenience wrapper that returns the complete updated PDF
 // bytes without writing a file.
+//
+// WriteToBytes is idempotent for a frozen Writer (no Add* calls between
+// successive WriteToBytes invocations). Calling Add* after WriteToBytes
+// produces objects that may collide with the catalog object number from the
+// previous build — don't do it. Construct a fresh Writer if you need to
+// append more objects.
 func (w *Writer) WriteToBytes() ([]byte, error) {
 	return w.buildBytes()
 }
@@ -177,7 +229,7 @@ func (w *Writer) buildBytes() ([]byte, error) {
 	// If the catalog should be updated, build and add a new catalog object.
 	var extraObjects []writtenObject
 	if w.catalogFn != nil {
-		newCat := w.catalogFn(cloneDict(w.doc.Catalog))
+		newCat := w.catalogFn(w.doc.Catalog.Clone())
 		catRef := w.allocRef()
 		catBody := fmt.Sprintf("%d %d obj\n%s\nendobj\n", catRef.Number, catRef.Generation, Serialize(newCat))
 		extraObjects = append(extraObjects, writtenObject{ref: catRef, data: []byte(catBody)})
@@ -240,6 +292,12 @@ func (w *Writer) buildBytes() ([]byte, error) {
 	}
 	if info, ok := w.doc.Trailer.GetRef("Info"); ok {
 		trailerDict["Info"] = info
+	}
+	// Preserve the file's /ID across incremental updates. Acrobat and many
+	// verifiers use /ID to correlate an update chain to the base file — Go's
+	// PDF parser stores the array as []any, so we copy it through verbatim.
+	if id, ok := w.doc.Trailer["ID"]; ok {
+		trailerDict["ID"] = id
 	}
 
 	xrefBuf.WriteString("trailer\n")

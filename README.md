@@ -6,7 +6,7 @@ It implements a 4-step signing workflow designed for external signing services (
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.23+
 
 ## Build
 

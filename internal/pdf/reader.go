@@ -5,10 +5,31 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 )
+
+// maxPDFTokenBytes bounds the size of a single parsed literal or hex string
+// token. A crafted PDF can otherwise force the parser to allocate a buffer
+// the size of the entire file. 64 MiB is far above any realistic legitimate
+// token and well under the point where allocation itself becomes the DoS.
+//
+// Declared as a var, not a const, so tests can lower it.
+var maxPDFTokenBytes = 64 << 20
+
+// MaxObjectCount caps the number of PDF objects a single file can declare
+// via trailer /Size. Beyond ~5 million the xref table itself becomes a DoS
+// surface (offsets map allocation + repeated object reads). No real
+// document comes close; the upper bound is five orders of magnitude above
+// typical usage.
+const MaxObjectCount = 5_000_000
+
+// hexStringWhitespaceStripper strips the whitespace characters a PDF hex
+// string may contain (per §7.3.4.3) in a single pass, avoiding three back-
+// to-back strings.ReplaceAll allocations.
+var hexStringWhitespaceStripper = strings.NewReplacer(" ", "", "\n", "", "\r", "", "\t", "")
 
 // Document holds a parsed PDF file.
 type Document struct {
@@ -22,8 +43,37 @@ type Document struct {
 	CatalogRef  Ref
 }
 
-// Open reads the file at path and parses it.
+// DefaultMaxInputSize is the default upper bound on bytes read from an
+// --input PDF. 500 MB matches R-6.1.6; operators with a specific need
+// above that can lift the cap via SetMaxInputSize before calling Open.
+const DefaultMaxInputSize = 500 << 20
+
+// maxInputSize is the runtime limit OpenWithLimit uses. Exposed as a var
+// so callers can scale it without forking Open.
+var maxInputSize int64 = DefaultMaxInputSize
+
+// SetMaxInputSize adjusts the default input-size cap. A bound of 0 means
+// "no cap"; any positive value is the hard ceiling. Negative is refused.
+func SetMaxInputSize(n int64) error {
+	if n < 0 {
+		return fmt.Errorf("max input size %d is negative", n)
+	}
+	maxInputSize = n
+	return nil
+}
+
+// Open reads the file at path, enforcing the current max-input-size cap,
+// and parses it. Oversized files are refused before parsing rather than
+// after allocating gigabytes of buffer state.
 func Open(path string) (*Document, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	if maxInputSize > 0 && info.Size() > maxInputSize {
+		return nil, fmt.Errorf("input %s (%d bytes) exceeds max-input-size (%d bytes)",
+			path, info.Size(), maxInputSize)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
@@ -62,9 +112,24 @@ func Parse(data []byte) (*Document, error) {
 		return nil, err
 	}
 
-	// Determine NextObjNum from trailer /Size.
+	// Determine NextObjNum from trailer /Size. Guard against crafted values:
+	// 0/negative is nonsensical, and absurd sizes will propagate into later
+	// allocations.
 	if size, ok := doc.Trailer.GetInt("Size"); ok {
+		if size <= 0 {
+			return nil, fmt.Errorf("invalid trailer /Size %d", size)
+		}
+		if size > MaxObjectCount {
+			return nil, fmt.Errorf("trailer /Size %d exceeds MaxObjectCount (%d)", size, MaxObjectCount)
+		}
 		doc.NextObjNum = size
+	}
+
+	// Encrypted PDFs (/Encrypt entry in trailer) would parse as ciphertext
+	// objects — all downstream work silently produces garbage. Refuse early
+	// with a clear error rather than misdiagnose later.
+	if _, ok := doc.Trailer["Encrypt"]; ok {
+		return nil, fmt.Errorf("encrypted PDFs are not supported")
 	}
 
 	// Read catalog.
@@ -83,8 +148,9 @@ func Parse(data []byte) (*Document, error) {
 // findStartXRef searches backward from EOF for "startxref" and returns the
 // xref table offset written after it.
 func findStartXRef(data []byte) (int64, error) {
-	// Search in the last 1024 bytes.
-	searchStart := len(data) - 1024
+	// 8 KiB tail covers PDFs with large trailing XMP metadata or chained
+	// signatures appended after the original document.
+	searchStart := len(data) - 8192
 	if searchStart < 0 {
 		searchStart = 0
 	}
@@ -112,38 +178,84 @@ func findStartXRef(data []byte) (int64, error) {
 	return offset, nil
 }
 
-// parseXRef dispatches to the appropriate xref parser.
+// parseXRef dispatches to the appropriate xref parser: the traditional
+// "xref ... trailer" table, or a PDF 1.5+ cross-reference stream object.
 func (doc *Document) parseXRef(offset int64) error {
-	if int(offset) >= len(doc.Data) {
+	if offset < 0 || offset >= int64(len(doc.Data)) {
 		return fmt.Errorf("xref offset %d out of range", offset)
 	}
 	chunk := doc.Data[offset:]
-	chunk = bytes.TrimLeft(chunk, " \t\r\n")
+	trimmed := bytes.TrimLeft(chunk, " \t\r\n")
 
-	if bytes.HasPrefix(chunk, []byte("xref")) {
+	if bytes.HasPrefix(trimmed, []byte("xref")) {
 		return doc.parseTraditionalXRef(doc.Data, offset)
 	}
-	// Could be a cross-reference stream — not implemented yet.
-	return errors.New("unsupported xref type (only traditional xref tables supported)")
+	// Anything else is expected to be a cross-reference stream: an indirect
+	// object of form "N G obj << /Type /XRef … >> stream … endstream endobj".
+	return doc.parseXRefStreamChain(offset)
 }
 
-// parseTraditionalXRef parses a traditional "xref ... trailer" block starting
-// at offset and follows /Prev chains for incremental updates.
+// parseXRefStreamChain walks a chain of xref streams via /Prev, with the same
+// cycle/depth protections as the traditional xref parser.
+func (doc *Document) parseXRefStreamChain(offset int64) error {
+	const maxXRefDepth = 1024
+	seen := make(map[int64]bool)
+	for depth := 0; depth < maxXRefDepth; depth++ {
+		if seen[offset] {
+			return fmt.Errorf("xref stream /Prev cycle at offset %d", offset)
+		}
+		seen[offset] = true
+		next, err := doc.parseXRefStream(offset)
+		if err != nil {
+			return err
+		}
+		if next == 0 {
+			return nil
+		}
+		offset = next
+	}
+	return fmt.Errorf("xref stream /Prev chain exceeded max depth %d", maxXRefDepth)
+}
+
+// parseTraditionalXRef parses one or more chained "xref ... trailer" blocks,
+// following /Prev pointers iteratively. Cycles and excessive depth are rejected.
 // Entries already present in doc.XRef (from a newer update) take priority.
 func (doc *Document) parseTraditionalXRef(data []byte, offset int64) error {
-	if int(offset) >= len(data) {
-		return fmt.Errorf("xref offset %d out of range", offset)
+	const maxXRefDepth = 1024
+	seen := make(map[int64]bool)
+
+	for depth := 0; depth < maxXRefDepth; depth++ {
+		if seen[offset] {
+			return fmt.Errorf("xref /Prev cycle at offset %d", offset)
+		}
+		seen[offset] = true
+
+		nextPrev, err := doc.parseOneXRefBlock(data, offset)
+		if err != nil {
+			return err
+		}
+		if nextPrev == 0 {
+			return nil
+		}
+		offset = nextPrev
+	}
+	return fmt.Errorf("xref /Prev chain exceeded max depth %d", maxXRefDepth)
+}
+
+// parseOneXRefBlock parses a single "xref ... trailer" block at offset and
+// returns the value of trailer /Prev (0 if none).
+func (doc *Document) parseOneXRefBlock(data []byte, offset int64) (int64, error) {
+	if offset < 0 || offset >= int64(len(data)) {
+		return 0, fmt.Errorf("xref offset %d out of range", offset)
 	}
 
 	sc := newScanner(data[offset:])
 
-	// Expect "xref".
 	line := sc.nextLine()
 	if strings.TrimSpace(line) != "xref" {
-		return fmt.Errorf("expected 'xref', got %q", line)
+		return 0, fmt.Errorf("expected 'xref', got %q", line)
 	}
 
-	// Parse subsections until we hit "trailer".
 	for {
 		line = sc.nextLine()
 		line = strings.TrimSpace(line)
@@ -153,65 +265,65 @@ func (doc *Document) parseTraditionalXRef(data []byte, offset int64) error {
 		if line == "" {
 			continue
 		}
-		// Parse "firstObj count".
 		parts := strings.Fields(line)
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid xref subsection header: %q", line)
+			return 0, fmt.Errorf("invalid xref subsection header: %q", line)
 		}
 		firstObj, err := strconv.Atoi(parts[0])
 		if err != nil {
-			return fmt.Errorf("invalid xref subsection first obj: %w", err)
+			return 0, fmt.Errorf("invalid xref subsection first obj: %w", err)
 		}
 		count, err := strconv.Atoi(parts[1])
 		if err != nil {
-			return fmt.Errorf("invalid xref subsection count: %w", err)
+			return 0, fmt.Errorf("invalid xref subsection count: %w", err)
+		}
+		if firstObj < 0 || count < 0 {
+			return 0, fmt.Errorf("invalid xref subsection: firstObj=%d count=%d", firstObj, count)
+		}
+		if firstObj > math.MaxInt-count {
+			return 0, fmt.Errorf("xref subsection firstObj+count overflows: firstObj=%d count=%d", firstObj, count)
 		}
 
 		for i := 0; i < count; i++ {
 			entry := sc.nextLine()
 			entry = strings.TrimSpace(entry)
 			if len(entry) < 18 {
-				return fmt.Errorf("short xref entry: %q", entry)
+				return 0, fmt.Errorf("short xref entry: %q", entry)
 			}
 			fields := strings.Fields(entry)
 			if len(fields) < 3 {
-				return fmt.Errorf("invalid xref entry: %q", entry)
+				return 0, fmt.Errorf("invalid xref entry: %q", entry)
 			}
 			objOff, err := strconv.ParseInt(fields[0], 10, 64)
 			if err != nil {
-				return fmt.Errorf("invalid xref entry offset: %w", err)
+				return 0, fmt.Errorf("invalid xref entry offset: %w", err)
 			}
 			flag := fields[2]
 			objNum := firstObj + i
 
-			// Only store if not already present (newer updates take priority).
 			if _, exists := doc.XRef[objNum]; !exists {
 				if flag == "n" {
 					doc.XRef[objNum] = objOff
 				}
-				// "f" entries (free) are ignored.
 			}
 		}
 	}
 
-	// Parse trailer dictionary.
 	trailerData := sc.rest()
 	trailerData = bytes.TrimLeft(trailerData, " \t\r\n")
 	if !bytes.HasPrefix(trailerData, []byte("<<")) {
-		return fmt.Errorf("expected trailer dict, got %q", string(trailerData[:min(20, len(trailerData))]))
+		return 0, fmt.Errorf("expected trailer dict, got %q", string(trailerData[:min(20, len(trailerData))]))
 	}
 
-	// Find matching ">>".
 	closeIdx := findMatchingClose(trailerData)
 	if closeIdx < 0 {
-		return errors.New("unterminated trailer dictionary")
+		return 0, errors.New("unterminated trailer dictionary")
 	}
 	trailerDict, err := parseDict(trailerData[:closeIdx+2])
 	if err != nil {
-		return fmt.Errorf("parse trailer dict: %w", err)
+		return 0, fmt.Errorf("parse trailer dict: %w", err)
 	}
 
-	// Merge trailer: only set keys not already present (current update wins).
 	if doc.Trailer == nil {
 		doc.Trailer = trailerDict
 	} else {
@@ -222,12 +334,27 @@ func (doc *Document) parseTraditionalXRef(data []byte, offset int64) error {
 		}
 	}
 
-	// Follow /Prev chain.
 	if prev, ok := trailerDict.GetInt("Prev"); ok && prev != 0 {
-		return doc.parseTraditionalXRef(data, int64(prev))
+		return int64(prev), nil
 	}
+	return 0, nil
+}
 
-	return nil
+// ResolveDict returns d if v is already a Dict, dereferences it via xref if v
+// is a Ref, and (nil, false) otherwise. Use this for catalog children like
+// /AcroForm and /DSS that may be either inline or indirect.
+func (doc *Document) ResolveDict(v any) (Dict, bool) {
+	switch t := v.(type) {
+	case Dict:
+		return t, true
+	case Ref:
+		d, err := doc.ReadDictObject(t)
+		if err != nil {
+			return nil, false
+		}
+		return d, true
+	}
+	return nil, false
 }
 
 // ReadDictObject reads the object at the given reference and returns its Dict.
@@ -236,7 +363,7 @@ func (doc *Document) ReadDictObject(ref Ref) (Dict, error) {
 	if !ok {
 		return nil, fmt.Errorf("object %d not found in xref", ref.Number)
 	}
-	if int(offset) >= len(doc.Data) {
+	if offset < 0 || offset >= int64(len(doc.Data)) {
 		return nil, fmt.Errorf("object %d offset %d out of range", ref.Number, offset)
 	}
 
@@ -267,6 +394,10 @@ func (doc *Document) ReadDictObject(ref Ref) (Dict, error) {
 
 // findMatchingClose finds the index of the ">>" that closes the "<<" at position 0.
 // data must start with "<<". Returns the index of the closing ">>" or -1.
+//
+// This function is permissive: malformed inputs (truncated dicts, dangling
+// strings, unmatched hex strings) yield -1 rather than an error. Callers must
+// handle the -1 return as an error condition.
 func findMatchingClose(data []byte) int {
 	depth := 0
 	i := 0
@@ -365,10 +496,18 @@ func parseDict(data []byte) (Dict, error) {
 	return d, nil
 }
 
-// parser is a recursive-descent PDF value parser.
+// MaxParserDepth bounds recursion inside a single parseDict/parseArray
+// chain. 256 is an order of magnitude above any legitimate PDF dict tree;
+// crafted inputs that try to exceed it are refused so the parser can't
+// be driven into a stack blow-up.
+const MaxParserDepth = 256
+
+// parser is a recursive-descent PDF value parser. The depth counter caps
+// recursion via MaxParserDepth.
 type parser struct {
-	data []byte
-	pos  int
+	data  []byte
+	pos   int
+	depth int
 }
 
 func (p *parser) skipWhitespace() {
@@ -394,12 +533,18 @@ func (p *parser) parseValue() (any, error) {
 	if p.pos >= len(p.data) {
 		return nil, errors.New("unexpected end of input")
 	}
+	if p.depth > MaxParserDepth {
+		return nil, fmt.Errorf("parser depth %d exceeds MaxParserDepth (%d)", p.depth, MaxParserDepth)
+	}
 
 	c := p.data[p.pos]
 
 	switch {
 	case c == '<' && p.pos+1 < len(p.data) && p.data[p.pos+1] == '<':
-		return p.parseDict()
+		p.depth++
+		d, err := p.parseDict()
+		p.depth--
+		return d, err
 	case c == '<':
 		return p.parseHexString()
 	case c == '/':
@@ -407,7 +552,10 @@ func (p *parser) parseValue() (any, error) {
 	case c == '(':
 		return p.parseString()
 	case c == '[':
-		return p.parseArray()
+		p.depth++
+		a, err := p.parseArray()
+		p.depth--
+		return a, err
 	case c == 't' && bytes.HasPrefix(p.data[p.pos:], []byte("true")):
 		p.pos += 4
 		return true, nil
@@ -484,30 +632,56 @@ func (p *parser) parseString() (string, error) {
 	var sb strings.Builder
 	depth := 1
 	for p.pos < len(p.data) && depth > 0 {
+		if sb.Len() > maxPDFTokenBytes {
+			return "", fmt.Errorf("literal string exceeds max length %d", maxPDFTokenBytes)
+		}
 		c := p.data[p.pos]
 		if c == '\\' && p.pos+1 < len(p.data) {
 			p.pos++
-			switch p.data[p.pos] {
+			next := p.data[p.pos]
+			switch next {
 			case 'n':
 				sb.WriteByte('\n')
+				p.pos++
 			case 'r':
 				sb.WriteByte('\r')
+				p.pos++
 			case 't':
 				sb.WriteByte('\t')
+				p.pos++
 			case 'b':
 				sb.WriteByte('\b')
+				p.pos++
 			case 'f':
 				sb.WriteByte('\f')
-			case '(':
-				sb.WriteByte('(')
-			case ')':
-				sb.WriteByte(')')
-			case '\\':
-				sb.WriteByte('\\')
+				p.pos++
+			case '(', ')', '\\':
+				sb.WriteByte(next)
+				p.pos++
+			case '\n':
+				p.pos++ // line continuation: drop backslash + LF
+			case '\r':
+				p.pos++ // line continuation: drop backslash + CR (and following LF)
+				if p.pos < len(p.data) && p.data[p.pos] == '\n' {
+					p.pos++
+				}
+			case '0', '1', '2', '3', '4', '5', '6', '7':
+				// Octal escape (1-3 digits).
+				val := 0
+				for i := 0; i < 3 && p.pos < len(p.data); i++ {
+					ch := p.data[p.pos]
+					if ch < '0' || ch > '7' {
+						break
+					}
+					val = val*8 + int(ch-'0')
+					p.pos++
+				}
+				sb.WriteByte(byte(val & 0xFF))
 			default:
-				sb.WriteByte(p.data[p.pos])
+				// Reverse-solidus before any other char: drop the solidus, keep the char.
+				sb.WriteByte(next)
+				p.pos++
 			}
-			p.pos++
 			continue
 		}
 		if c == '(' {
@@ -532,11 +706,12 @@ func (p *parser) parseHexString() ([]byte, error) {
 	p.pos++ // skip '<'
 	start := p.pos
 	for p.pos < len(p.data) && p.data[p.pos] != '>' {
+		if p.pos-start > maxPDFTokenBytes {
+			return nil, fmt.Errorf("hex string exceeds max length %d", maxPDFTokenBytes)
+		}
 		p.pos++
 	}
-	hexStr := strings.ReplaceAll(string(p.data[start:p.pos]), " ", "")
-	hexStr = strings.ReplaceAll(hexStr, "\n", "")
-	hexStr = strings.ReplaceAll(hexStr, "\r", "")
+	hexStr := hexStringWhitespaceStripper.Replace(string(p.data[start:p.pos]))
 	if len(hexStr)%2 != 0 {
 		hexStr += "0"
 	}
@@ -593,7 +768,7 @@ func (p *parser) parseNumberOrRef() (any, error) {
 		return f, nil
 	}
 
-	// Save position after first integer.
+	// Save position after first integer for the "not-a-ref" rollback below.
 	afterN1 := p.pos
 
 	// Lookahead: skip whitespace, try to read second integer.
@@ -635,7 +810,6 @@ func (p *parser) parseNumberOrRef() (any, error) {
 		return n1, nil
 	}
 
-	afterN2 := p.pos
 	p.skipWhitespace()
 
 	if p.pos < len(p.data) && p.data[p.pos] == 'R' {
@@ -647,15 +821,19 @@ func (p *parser) parseNumberOrRef() (any, error) {
 			p.data[afterR] == '>' || p.data[afterR] == ']' ||
 			p.data[afterR] == '/' {
 			p.pos++ // consume 'R'
-			n1, _ := strconv.Atoi(n1Str)
-			n2, _ := strconv.Atoi(n2Str)
+			n1, err := strconv.Atoi(n1Str)
+			if err != nil {
+				return nil, fmt.Errorf("invalid object number %q: %w", n1Str, err)
+			}
+			n2, err := strconv.Atoi(n2Str)
+			if err != nil {
+				return nil, fmt.Errorf("invalid generation number %q: %w", n2Str, err)
+			}
 			return Ref{Number: n1, Generation: n2}, nil
 		}
 	}
 
 	// Not a reference — restore to after first number.
-	p.pos = afterN2
-	_ = afterN2
 	p.pos = afterN1
 	n1, err := strconv.ParseInt(n1Str, 10, 64)
 	if err != nil {

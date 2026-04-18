@@ -169,3 +169,41 @@ func TestPrepareMultipleSignatures(t *testing.T) {
 		t.Error("first and second hashes are identical, expected different")
 	}
 }
+
+func TestPreparePreservesExistingAcroFormKeys(t *testing.T) {
+	src := writePDFFixture(t, []string{
+		"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>\nendobj\n",
+		"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+		"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+		"4 0 obj\n<< /NeedAppearances true /Fields [5 0 R] /DA (/Helv 0 Tf 0 g) >>\nendobj\n",
+		"5 0 obj\n<< /T (ExistingTextField) /FT /Tx >>\nendobj\n",
+	}, "")
+
+	out := filepath.Join(t.TempDir(), "out.pdf")
+	if _, err := Prepare(PrepareOptions{
+		InputPath: src, OutputPath: out,
+		SignerName: "Test", SigningMethod: "cmd",
+		SignaturePos: appearance.DefaultPosition(0),
+	}); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	doc, err := pdf.Open(out)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	acro, ok := doc.ResolveDict(doc.Catalog["AcroForm"])
+	if !ok {
+		t.Fatal("output catalog has no AcroForm")
+	}
+	if v, ok := acro["NeedAppearances"]; !ok || v != true {
+		t.Errorf("NeedAppearances lost: got %v ok=%v", v, ok)
+	}
+	if _, ok := acro["DA"]; !ok {
+		t.Error("DA dropped from AcroForm")
+	}
+	fields, ok := acro.GetArray("Fields")
+	if !ok || len(fields) != 2 {
+		t.Errorf("Fields = %v ok=%v, want 2 entries (existing + new sig)", fields, ok)
+	}
+}

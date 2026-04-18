@@ -1,6 +1,8 @@
 package pades
 
 import (
+	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -9,7 +11,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
-	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -305,7 +306,7 @@ func TestFinalize(t *testing.T) {
 
 	// 5. Call Finalize.
 	outputPath := filepath.Join(t.TempDir(), "finalized.pdf")
-	result, err := Finalize(FinalizeOptions{
+	result, err := Finalize(context.Background(), FinalizeOptions{
 		InputPath:  signedPath,
 		OutputPath: outputPath,
 	})
@@ -345,7 +346,7 @@ func TestFinalizeNoSignatures(t *testing.T) {
 	inputPath := createTestPDF(t)
 	outputPath := filepath.Join(t.TempDir(), "finalized.pdf")
 
-	_, err := Finalize(FinalizeOptions{
+	_, err := Finalize(context.Background(), FinalizeOptions{
 		InputPath:  inputPath,
 		OutputPath: outputPath,
 	})
@@ -386,13 +387,35 @@ func TestDetermineLTVStatus(t *testing.T) {
 			want:        "partial",
 		},
 		{
-			name: "OCSP and chain certs",
+			name: "OCSP and chain certs, chain incomplete → partial",
 			dss: &DSSData{
 				Certs: [][]byte{[]byte("leaf"), []byte("intermediate")},
 				OCSPs: [][]byte{[]byte("ocsp")},
+				// ChainsComplete defaults to false → partial, not valid.
+			},
+			signerCerts: []*x509.Certificate{{}},
+			want:        "partial",
+		},
+		{
+			name: "OCSP + chain complete → valid",
+			dss: &DSSData{
+				Certs:          [][]byte{[]byte("leaf"), []byte("intermediate")},
+				OCSPs:          [][]byte{[]byte("ocsp")},
+				ChainsComplete: true,
 			},
 			signerCerts: []*x509.Certificate{{}},
 			want:        "valid",
+		},
+		{
+			name: "chain complete but a warning recorded → partial",
+			dss: &DSSData{
+				Certs:          [][]byte{[]byte("leaf"), []byte("intermediate")},
+				OCSPs:          [][]byte{[]byte("ocsp")},
+				ChainsComplete: true,
+				Warnings:       []string{"signer expired"},
+			},
+			signerCerts: []*x509.Certificate{{}},
+			want:        "partial",
 		},
 		{
 			name: "CRL only",
@@ -431,23 +454,91 @@ func TestVRIKeyComputation(t *testing.T) {
 }
 
 
-func TestIsAllZeros(t *testing.T) {
-	tests := []struct {
-		input string
-		want  bool
-	}{
-		{"", false},
-		{"0", true},
-		{"000", true},
-		{"001", false},
-		{"abc", false},
+func TestFinalizeReportsTSANotImplemented(t *testing.T) {
+	inputPath := createTestPDF(t)
+	preparedPath := filepath.Join(t.TempDir(), "prepared.pdf")
+	if _, err := Prepare(PrepareOptions{
+		InputPath: inputPath, OutputPath: preparedPath,
+		SignerName: "Test", SigningMethod: "cmd",
+		SignaturePos: appearance.DefaultPosition(0),
+	}); err != nil {
+		t.Fatalf("Prepare: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%q", tt.input), func(t *testing.T) {
-			got := isAllZeros(tt.input)
-			if got != tt.want {
-				t.Errorf("isAllZeros(%q) = %v, want %v", tt.input, got, tt.want)
-			}
-		})
+	cms, _ := buildTestCMS(t)
+	data, _ := os.ReadFile(preparedPath)
+	data, _ = pdf.EmbedCMS(data, cms)
+	signedPath := filepath.Join(t.TempDir(), "signed.pdf")
+	_ = os.WriteFile(signedPath, data, 0600)
+
+	out := filepath.Join(t.TempDir(), "out.pdf")
+	res, err := Finalize(context.Background(), FinalizeOptions{
+		InputPath: signedPath, OutputPath: out,
+		TSAUrl: "http://tsa.example.com",
+	})
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if res.TSAStatus != "not_implemented" {
+		t.Errorf("TSAStatus = %q, want %q", res.TSAStatus, "not_implemented")
+	}
+}
+
+func TestExtractSignatureContentsPreservesTrailingZeroByte(t *testing.T) {
+	inputPath := createTestPDF(t)
+	preparedPath := filepath.Join(t.TempDir(), "prepared.pdf")
+	if _, err := Prepare(PrepareOptions{
+		InputPath: inputPath, OutputPath: preparedPath,
+		SignerName: "Test", SigningMethod: "cmd",
+		SignaturePos: appearance.DefaultPosition(0),
+	}); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// Real DER-shaped bytes (SEQUENCE, length 4, payload ending in 0x00).
+	derEndingInZero := []byte{0x30, 0x04, 0x01, 0x02, 0x03, 0x00}
+
+	data, err := os.ReadFile(preparedPath)
+	if err != nil {
+		t.Fatalf("read prepared: %v", err)
+	}
+	data, err = pdf.EmbedCMS(data, derEndingInZero)
+	if err != nil {
+		t.Fatalf("EmbedCMS: %v", err)
+	}
+	doc, err := pdf.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	contents, err := extractSignatureContents(doc)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if len(contents) != 1 {
+		t.Fatalf("got %d signatures, want 1", len(contents))
+	}
+	if !bytes.Equal(contents[0], derEndingInZero) {
+		t.Errorf("decoded = %x, want %x (trailing 0x00 must be preserved)",
+			contents[0], derEndingInZero)
+	}
+}
+
+func TestExtractSignatureContentsIgnoresNonSigContents(t *testing.T) {
+	// PDF with no AcroForm but a stray /Contents <hex> on a page object.
+	src := writePDFFixture(t, []string{
+		"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+		"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+		"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents <30040102030500> >>\nendobj\n",
+	}, "")
+	doc, err := pdf.Open(src)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	contents, err := extractSignatureContents(doc)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if len(contents) != 0 {
+		t.Errorf("got %d signatures, want 0 (the /Contents <hex> is on a Page, not a Sig)", len(contents))
 	}
 }

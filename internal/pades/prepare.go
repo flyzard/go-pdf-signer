@@ -3,12 +3,25 @@ package pades
 import (
 	"encoding/base64"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/flyzard/pdf-signer/internal/appearance"
 	"github.com/flyzard/pdf-signer/internal/pdf"
+)
+
+// CertificationLevel enumerates the DocMDP permission levels per
+// ISO 32000-1 §12.8.2.2. Level 0 means "no DocMDP entry emitted" — plain
+// approval signature. Only the FIRST signature in a document may assert a
+// certification level; subsequent approval signatures must leave it
+// untouched or Adobe flags the document.
+type CertificationLevel int
+
+const (
+	CertLevelNone         CertificationLevel = 0 // no /Perms /DocMDP emitted
+	CertLevelNoChanges    CertificationLevel = 1 // any change invalidates the signature
+	CertLevelFormFilling  CertificationLevel = 2 // form fill + signatures allowed
+	CertLevelAnnotations  CertificationLevel = 3 // + annotations allowed
 )
 
 // PrepareOptions configures the prepare step.
@@ -19,6 +32,26 @@ type PrepareOptions struct {
 	SignerNIC     string
 	SigningMethod string
 	SignaturePos  appearance.Position
+	// PlaceholderSize overrides the in-PDF /Contents placeholder capacity in
+	// bytes. Zero means use pdf.PlaceholderSize (16 KB) — the right default
+	// for B-B / B-LT without a signature-TS. Bump to 32+ KB when callers know
+	// the CMS will carry a timestamp token or a long cert chain.
+	PlaceholderSize int
+	// Reason / Location / Name populate the corresponding /Reason /Location
+	// /Name entries in the signature dict. Empty → sensible PT defaults
+	// ("Assinatura digital de ata" / "Portugal" / SignerName).
+	Reason   string
+	Location string
+	Name     string
+	// Invisible suppresses the visible stamp: widget /Rect is [0 0 0 0] and
+	// no appearance XObject is emitted. Use for workflows that sign
+	// programmatically without any visual mark.
+	Invisible bool
+	// CertificationLevel writes /Perms /DocMDP on the catalog, marking this
+	// signature as a certification (DocMDP) signature. Must be the FIRST
+	// signature in the document. CertLevelNone (default) emits a plain
+	// approval signature.
+	CertificationLevel CertificationLevel
 }
 
 // PrepareResult contains the output of the prepare step.
@@ -31,48 +64,85 @@ type PrepareResult struct {
 // Prepare opens the input PDF, adds a signature placeholder with visible stamp,
 // computes the ByteRange hash, and writes the prepared PDF to output.
 func Prepare(opts PrepareOptions) (*PrepareResult, error) {
-	// 1. Open the input PDF.
 	doc, err := pdf.Open(opts.InputPath)
 	if err != nil {
 		return nil, fmt.Errorf("open input PDF: %w", err)
 	}
 
-	// 2. Count existing signatures from AcroForm /Fields to determine index.
 	sigIndex := countExistingSignatures(doc)
 	fieldName := fmt.Sprintf("Sig_%d", sigIndex+1)
 
-	// 3. Create writer.
 	w := pdf.NewWriter(doc)
+	if opts.PlaceholderSize > 0 {
+		if err := w.SetPlaceholderSize(opts.PlaceholderSize); err != nil {
+			return nil, fmt.Errorf("set placeholder size: %w", err)
+		}
+	}
 
-	// 4. Create appearance XObject.
 	now := time.Now().UTC()
 	dateStr := now.Format("2006-01-02 15:04:05 UTC")
 
-	info := appearance.SignerInfo{
-		Name:          opts.SignerName,
-		NIC:           opts.SignerNIC,
-		SigningMethod: opts.SigningMethod,
-		DateTime:      dateStr,
+	// Appearance XObject is skipped when --invisible is set (R-5.4.5 /
+	// R-1.1.11). The widget uses /Rect [0 0 0 0] in that case.
+	var apRef pdf.Ref
+	if !opts.Invisible {
+		info := appearance.SignerInfo{
+			Name:          opts.SignerName,
+			NIC:           opts.SignerNIC,
+			SigningMethod: opts.SigningMethod,
+			DateTime:      dateStr,
+		}
+		apContent, apDict := appearance.CreateAppearanceXObject(info, opts.SignaturePos)
+		apRef = w.AddStream(apContent, apDict)
 	}
-	apContent, apDict := appearance.CreateAppearanceXObject(info, opts.SignaturePos)
-	apRef := w.AddStream(apContent, apDict)
 
-	// 5. Create signature dictionary.
+	// pdfDate hard-codes "+00'00'" because we use UTC above. If you ever
+	// change `now` to local time, this format string will misreport the offset.
 	pdfDate := now.Format("D:20060102150405+00'00'")
+	reason := opts.Reason
+	if reason == "" {
+		reason = "Assinatura digital de ata"
+	}
+	location := opts.Location
+	if location == "" {
+		location = "Portugal"
+	}
+	name := opts.Name
+	if name == "" {
+		name = opts.SignerName
+	}
 	sigDict := pdf.Dict{
 		"Type":      pdf.Name("Sig"),
 		"Filter":    pdf.Name("Adobe.PPKLite"),
 		"SubFilter": pdf.Name("ETSI.CAdES.detached"),
-		"Reason":    "Assinatura digital de ata",
-		"Location":  "Portugal",
+		"Reason":    reason,
+		"Location":  location,
 		"M":         pdfDate,
-		"Name":      opts.SignerName,
+		"Name":      name,
+	}
+	if opts.CertificationLevel != CertLevelNone {
+		if sigIndex != 0 {
+			return nil, fmt.Errorf("--certification-level is only valid on the FIRST signature (this would be #%d)", sigIndex+1)
+		}
+		sigDict["Reference"] = []any{buildDocMDPSigRef(opts.CertificationLevel)}
 	}
 	sigRef := w.AddSignatureObject(sigDict)
 
-	// 6. Create widget annotation.
 	pos := opts.SignaturePos
 	rect := []any{pos.X, pos.Y, pos.X + pos.Width, pos.Y + pos.Height}
+	if opts.Invisible {
+		rect = []any{0, 0, 0, 0}
+	}
+
+	// Resolve the target page BEFORE building the widget so /P can point
+	// at it. Without /P + page-/Annots membership the widget exists only
+	// in AcroForm.Fields and Adobe Reader will list the signature in the
+	// Signatures panel but paint nothing on the page.
+	pageRef, err := doc.FindPageRef(pos.Page)
+	if err != nil {
+		return nil, fmt.Errorf("resolve signature page (index %d): %w", pos.Page, err)
+	}
+
 	widgetDict := pdf.Dict{
 		"Type":    pdf.Name("Annot"),
 		"Subtype": pdf.Name("Widget"),
@@ -81,62 +151,94 @@ func Prepare(opts PrepareOptions) (*PrepareResult, error) {
 		"V":       sigRef,
 		"Rect":    rect,
 		"F":       132,
-		"AP": pdf.Dict{
-			"N": apRef,
-		},
+		"P":       pageRef,
+	}
+	if !opts.Invisible {
+		widgetDict["AP"] = pdf.Dict{"N": apRef}
 	}
 	widgetRef := w.AddObject(widgetDict)
 
-	// 7. Update catalog with AcroForm.
+	// Append widgetRef to the target page's /Annots. Without this step
+	// the widget is invisible in every PDF viewer — the signature is
+	// cryptographically valid but the user sees no stamp on the page.
+	pageDict, err := doc.PageDict(pageRef)
+	if err != nil {
+		return nil, fmt.Errorf("read page dict for /Annots update: %w", err)
+	}
+	existing, _ := pageDict.GetArray("Annots")
+	pageAnnots := make([]any, 0, len(existing)+1)
+	pageAnnots = append(pageAnnots, existing...)
+	pageAnnots = append(pageAnnots, widgetRef)
+	pageDict["Annots"] = pageAnnots
+	w.ReplaceObject(pageRef, pageDict)
+
+	// Update catalog with AcroForm — preserve every existing key, just
+	// merge the new sig field into /Fields and ensure /SigFlags includes
+	// AppendOnly|SignaturesExist.
 	w.UpdateCatalog(func(cat pdf.Dict) pdf.Dict {
-		// Build the fields array, preserving any existing fields.
+		acro, _ := doc.ResolveDict(cat["AcroForm"])
+		if acro == nil {
+			acro = pdf.Dict{}
+		} else {
+			acro = acro.Clone()
+		}
+
 		var fields []any
-		if existingAcroForm, ok := cat.GetDict("AcroForm"); ok {
-			if existingFields, ok := existingAcroForm.GetArray("Fields"); ok {
-				fields = append(fields, existingFields...)
-			}
+		if existing, ok := acro.GetArray("Fields"); ok {
+			fields = append(fields, existing...)
 		}
 		fields = append(fields, widgetRef)
+		acro["Fields"] = fields
 
-		cat["AcroForm"] = pdf.Dict{
-			"SigFlags": 3,
-			"Fields":   fields,
+		existingFlags, _ := acro.GetInt("SigFlags")
+		acro["SigFlags"] = existingFlags | 3
+
+		cat["AcroForm"] = acro
+
+		// DocMDP: the catalog's /Perms /DocMDP points at the signature
+		// asserting certification semantics. Only one certification
+		// signature per document (ISO 32000-1 §12.8.2.2); we already
+		// refuse sigIndex != 0 above.
+		if opts.CertificationLevel != CertLevelNone {
+			perms, _ := doc.ResolveDict(cat["Perms"])
+			if perms == nil {
+				perms = pdf.Dict{}
+			} else {
+				perms = perms.Clone()
+			}
+			perms["DocMDP"] = sigRef
+			cat["Perms"] = perms
 		}
+
 		return cat
 	})
 
-	// 8. Build the PDF bytes in memory.
 	data, err := w.WriteToBytes()
 	if err != nil {
 		return nil, fmt.Errorf("build PDF bytes: %w", err)
 	}
 
-	// 9. Find placeholder to get ByteRange.
 	br, err := pdf.FindPlaceholder(data)
 	if err != nil {
 		return nil, fmt.Errorf("find placeholder: %w", err)
 	}
 
-	// 10. Patch the ByteRange in memory.
 	data, err = patchByteRange(data, br)
 	if err != nil {
 		return nil, fmt.Errorf("patch byte range: %w", err)
 	}
 
-	// 11. Re-find placeholder and hash the final bytes.
-	br, err = pdf.FindPlaceholder(data)
+	// br is byte-stable across the in-place ByteRange patch (length preserved
+	// by padding), so no re-find is needed.
+	hash, err := pdf.HashByteRanges(data, br)
 	if err != nil {
-		return nil, fmt.Errorf("find placeholder after patch: %w", err)
+		return nil, fmt.Errorf("hash byte ranges: %w", err)
 	}
 
-	hash := pdf.HashByteRanges(data, br)
-
-	// 12. Write final result to disk once.
-	if err := os.WriteFile(opts.OutputPath, data, 0600); err != nil {
-		return nil, fmt.Errorf("write output PDF: %w", err)
+	if err := pdf.WriteFileAtomic(opts.OutputPath, data); err != nil {
+		return nil, fmt.Errorf("write output PDF %s: %w", opts.OutputPath, err)
 	}
 
-	// 13. Return result.
 	return &PrepareResult{
 		Hash:          base64.StdEncoding.EncodeToString(hash),
 		HashAlgorithm: "SHA-256",
@@ -183,10 +285,9 @@ func patchByteRange(data []byte, br pdf.ByteRange) ([]byte, error) {
 	return result, nil
 }
 
-// countExistingSignatures inspects the catalog's AcroForm /Fields for existing
-// signature fields. Returns 0 if no AcroForm or no signatures found.
+// countExistingSignatures counts AcroForm leaf fields whose /FT is /Sig.
 func countExistingSignatures(doc *pdf.Document) int {
-	acroForm, ok := doc.Catalog.GetDict("AcroForm")
+	acroForm, ok := doc.ResolveDict(doc.Catalog["AcroForm"])
 	if !ok {
 		return 0
 	}
@@ -194,21 +295,11 @@ func countExistingSignatures(doc *pdf.Document) int {
 	if !ok {
 		return 0
 	}
-
 	count := 0
-	for _, f := range fields {
-		ref, ok := f.(pdf.Ref)
-		if !ok {
-			continue
-		}
-		fieldDict, err := doc.ReadDictObject(ref)
-		if err != nil {
-			continue
-		}
-		ft, ok := fieldDict.GetName("FT")
-		if ok && ft == "Sig" {
+	walkFieldTree(doc, fields, func(fd pdf.Dict) {
+		if ft, ok := fd.GetName("FT"); ok && ft == "Sig" {
 			count++
 		}
-	}
+	})
 	return count
 }

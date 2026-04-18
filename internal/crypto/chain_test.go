@@ -1,11 +1,14 @@
 package crypto
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -84,7 +87,7 @@ func generateTestLeaf(t *testing.T, caCert *x509.Certificate, caKey *rsa.Private
 func TestBuildChainSelfSigned(t *testing.T) {
 	root, _ := generateTestCA(t)
 
-	result, err := BuildChain(root)
+	result, err := BuildChain(context.Background(), root)
 	if err != nil {
 		t.Fatalf("BuildChain returned error: %v", err)
 	}
@@ -108,7 +111,7 @@ func TestBuildChainNoAIA(t *testing.T) {
 	root, rootKey := generateTestCA(t)
 	leaf, _ := generateTestLeaf(t, root, rootKey)
 
-	result, err := BuildChain(leaf)
+	result, err := BuildChain(context.Background(), leaf)
 	if err != nil {
 		t.Fatalf("BuildChain returned error: %v", err)
 	}
@@ -123,5 +126,44 @@ func TestBuildChainNoAIA(t *testing.T) {
 
 	if result.IsComplete {
 		t.Error("chain without AIA and no trusted root should be IsComplete=false")
+	}
+}
+
+func TestBuildChainRejectsUnrelatedAIA(t *testing.T) {
+	allowLoopbackForTest(t)
+
+	ca1, ca1Key := generateTestCA(t)
+	ca2, _ := generateTestCA(t)
+
+	leafTpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(99),
+		Subject:               pkix.Name{CommonName: "Mismatched Leaf"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	leafKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTpl, ca1, &leafKey.PublicKey, ca1Key)
+	if err != nil {
+		t.Fatalf("create leaf: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(ca2.Raw) // wrong issuer
+	}))
+	defer srv.Close()
+
+	leaf, _ := x509.ParseCertificate(leafDER)
+	leaf.IssuingCertificateURL = []string{srv.URL}
+
+	res, err := BuildChain(context.Background(), leaf)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+	for _, c := range res.Certificates[1:] {
+		if c.SerialNumber.Cmp(ca2.SerialNumber) == 0 {
+			t.Fatal("BuildChain accepted CA2 as issuer of leaf signed by CA1")
+		}
 	}
 }

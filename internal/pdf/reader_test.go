@@ -1,11 +1,14 @@
 package pdf
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenPDF(t *testing.T) {
@@ -200,4 +203,78 @@ func TestRealPDF(t *testing.T) {
 		t.Error("Catalog is nil for real PDF")
 	}
 	t.Logf("Real PDF: version=%s, objects=%d, catalog=%v", doc.Version, doc.NextObjNum, doc.Catalog)
+}
+
+func TestParseStringHandlesOctalAndLineContinuation(t *testing.T) {
+	// Octal: \053 = '+'.
+	d, err := parseDict([]byte(`<< /K (\053) >>`))
+	if err != nil {
+		t.Fatalf("parseDict: %v", err)
+	}
+	if got := d["K"].(string); got != "+" {
+		t.Errorf("octal escape: got %q, want %q", got, "+")
+	}
+
+	// Line continuation: \<LF> consumed entirely.
+	d, err = parseDict([]byte("<< /K (a\\\nb) >>"))
+	if err != nil {
+		t.Fatalf("parseDict (continuation): %v", err)
+	}
+	if got := d["K"].(string); got != "ab" {
+		t.Errorf("line continuation: got %q, want %q", got, "ab")
+	}
+}
+
+func TestSerializePanicsOnUnknownType(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for unsupported type, got none")
+		}
+	}()
+	type weird struct{ X int }
+	_ = Serialize(weird{X: 1})
+}
+
+func TestParseXRefRejectsPrevCycle(t *testing.T) {
+	objects := []string{
+		"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+	}
+	prefix := []byte("%PDF-1.7\n")
+	for _, o := range objects {
+		prefix = append(prefix, o...)
+	}
+	xref1Start := len(prefix)
+
+	prevPlaceholder := "PPPPPPPPPP"
+	xref1 := fmt.Sprintf("xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R /Prev %s >>\nstartxref\n%d\n%%%%EOF\n",
+		prevPlaceholder, xref1Start)
+
+	xref2Start := xref1Start + len(xref1)
+	xref2 := fmt.Sprintf("xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R /Prev %d >>\nstartxref\n%d\n%%%%EOF\n",
+		xref1Start, xref2Start)
+
+	all := append(append(prefix, []byte(xref1)...), []byte(xref2)...)
+	patch := []byte(fmt.Sprintf("%-10d", xref2Start))
+	all = bytes.Replace(all, []byte(prevPlaceholder), patch, 1)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cycle.pdf")
+	if err := os.WriteFile(path, all, 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Open(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error for /Prev cycle, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Open hung — /Prev cycle was not detected")
+	}
 }

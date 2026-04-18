@@ -3,7 +3,9 @@ package pdf
 import (
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -29,7 +31,24 @@ func (n Name) String() string {
 // Dict is a PDF dictionary.
 type Dict map[string]any
 
+// Clone returns a shallow copy of d. Callers that mutate an existing
+// catalog/AcroForm/Perms dict should Clone first so the original parsed
+// document stays untouched.
+func (d Dict) Clone() Dict {
+	if d == nil {
+		return nil
+	}
+	out := make(Dict, len(d))
+	for k, v := range d {
+		out[k] = v
+	}
+	return out
+}
+
 // GetInt returns the integer value for key, ok=false if missing or wrong type.
+// For float64 values, the caller is refused unless the value is finite, has
+// no fractional part, and fits in a Go int — silent truncation of 1e20 or
+// NaN is worse than a missing value.
 func (d Dict) GetInt(key string) (int, bool) {
 	v, ok := d[key]
 	if !ok {
@@ -39,8 +58,20 @@ func (d Dict) GetInt(key string) (int, bool) {
 	case int:
 		return t, true
 	case int64:
+		if t < math.MinInt || t > math.MaxInt {
+			return 0, false
+		}
 		return int(t), true
 	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return 0, false
+		}
+		if t != math.Trunc(t) {
+			return 0, false
+		}
+		if t < math.MinInt || t > math.MaxInt {
+			return 0, false
+		}
 		return int(t), true
 	}
 	return 0, false
@@ -108,9 +139,10 @@ func Serialize(v any) string {
 	case int64:
 		return fmt.Sprintf("%d", t)
 	case float64:
-		return fmt.Sprintf("%g", t)
+		// PDF disallows scientific notation in numeric literals.
+		return strconv.FormatFloat(t, 'f', -1, 64)
 	case string:
-		return "(" + escapeString(t) + ")"
+		return serializeText(t)
 	case Name:
 		return t.String()
 	case Ref:
@@ -122,7 +154,7 @@ func Serialize(v any) string {
 	case []byte:
 		return "<" + hex.EncodeToString(t) + ">"
 	default:
-		return "null"
+		panic(fmt.Sprintf("pdf.Serialize: unsupported value type %T (value: %v)", v, v))
 	}
 }
 
@@ -145,6 +177,10 @@ func serializeDict(d Dict) string {
 	return sb.String()
 }
 
+// serializeArray emits "[A B C]" with single-space separators and no leading/
+// trailing space inside the brackets — accepted by the PDF spec. No current
+// caller can produce an element whose serialized form starts with '[' or '<',
+// which would otherwise be ambiguous against the brackets.
 func serializeArray(a []any) string {
 	var sb strings.Builder
 	sb.WriteString("[")
@@ -156,6 +192,43 @@ func serializeArray(a []any) string {
 	}
 	sb.WriteString("]")
 	return sb.String()
+}
+
+// serializeText emits a PDF string literal for the given Go string. If the
+// string is pure ASCII it is written as a parenthesised literal with the
+// usual escapes; otherwise it is emitted as a hex string of the UTF-16BE
+// encoding with a 0xFEFF BOM. Readers default to PDFDocEncoding on bare
+// literals, which would render Portuguese (and any non-Latin) signer names
+// as mojibake.
+func serializeText(s string) string {
+	if isASCII(s) {
+		return "(" + escapeString(s) + ")"
+	}
+	var sb strings.Builder
+	sb.WriteByte('<')
+	sb.WriteString("FEFF")
+	for _, r := range s {
+		if r > 0xFFFF {
+			// Outside BMP — emit surrogate pair.
+			r -= 0x10000
+			hi := 0xD800 + (r >> 10)
+			lo := 0xDC00 + (r & 0x3FF)
+			fmt.Fprintf(&sb, "%04X%04X", hi, lo)
+			continue
+		}
+		fmt.Fprintf(&sb, "%04X", r)
+	}
+	sb.WriteByte('>')
+	return sb.String()
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 0x7E || s[i] < 0x20 && s[i] != '\t' && s[i] != '\r' && s[i] != '\n' {
+			return false
+		}
+	}
+	return true
 }
 
 func escapeString(s string) string {

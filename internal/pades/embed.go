@@ -32,8 +32,19 @@ func Embed(opts EmbedOptions) error {
 		return fmt.Errorf("embed CMS: %w", err)
 	}
 
-	if err := os.WriteFile(opts.OutputPath, signedData, 0600); err != nil {
-		return fmt.Errorf("write output PDF: %w", err)
+	// Sanity: EmbedCMS overwrites only bytes inside the fixed-size placeholder,
+	// so xref and trailer cannot have moved. The one realistic regression —
+	// a logic bug that fails to replace the zero hex — is caught here without
+	// a full reparse of the output. FindPlaceholder only matches all-zero
+	// runs between angle brackets, so real CMS content (which starts with
+	// DER `30 82 ...`) will not register even if it contains embedded zero
+	// bytes.
+	if _, err := pdf.FindPlaceholder(signedData); err == nil {
+		return fmt.Errorf("embed CMS: placeholder still present in output")
+	}
+
+	if err := pdf.WriteFileAtomic(opts.OutputPath, signedData); err != nil {
+		return fmt.Errorf("write output PDF %s: %w", opts.OutputPath, err)
 	}
 
 	return nil

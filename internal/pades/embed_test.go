@@ -2,6 +2,7 @@ package pades
 
 import (
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -93,7 +94,8 @@ func TestEmbedCMSTooLarge(t *testing.T) {
 		t.Fatalf("write CMS file: %v", err)
 	}
 
-	// 4. Call Embed — should return an error.
+	// 4. Call Embed — should return ErrPlaceholderTooSmall so the CLI can
+	// surface exit code 5 (PLACEHOLDER_TOO_SMALL).
 	outputPath := filepath.Join(t.TempDir(), "signed.pdf")
 	err = Embed(EmbedOptions{
 		InputPath:  preparedPath,
@@ -102,5 +104,71 @@ func TestEmbedCMSTooLarge(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for oversized CMS, got nil")
+	}
+	if !errors.Is(err, pdf.ErrPlaceholderTooSmall) {
+		t.Fatalf("expected ErrPlaceholderTooSmall, got %v", err)
+	}
+}
+
+// TestPrepareWithCustomPlaceholderSize verifies the --placeholder-size flag
+// path end-to-end: a larger placeholder is emitted, EmbedCMS uses the
+// detected size (not the compile-time default), and FindPlaceholder still
+// locates the placeholder in the intermediate file.
+func TestPrepareWithCustomPlaceholderSize(t *testing.T) {
+	inputPath := createTestPDF(t)
+	preparedPath := filepath.Join(t.TempDir(), "prepared.pdf")
+	const customSize = 32 * 1024 // 2x default
+	_, err := Prepare(PrepareOptions{
+		InputPath:       inputPath,
+		OutputPath:      preparedPath,
+		SignerName:      "Test User",
+		SigningMethod:   "cmd",
+		SignaturePos:    appearance.DefaultPosition(0),
+		PlaceholderSize: customSize,
+	})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// A CMS blob that fits the custom size but not the default — proves the
+	// custom size is actually honoured on both write and embed sides.
+	cmsData := make([]byte, pdf.PlaceholderSize+100)
+	if _, err := rand.Read(cmsData); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	// Force a non-zero first byte so the post-embed FindPlaceholder check
+	// cannot accidentally treat the remainder as a new placeholder.
+	cmsData[0] = 0x30
+
+	cmsPath := filepath.Join(t.TempDir(), "fake.cms")
+	if err := os.WriteFile(cmsPath, cmsData, 0644); err != nil {
+		t.Fatalf("write CMS file: %v", err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "signed.pdf")
+	if err := Embed(EmbedOptions{
+		InputPath:  preparedPath,
+		OutputPath: outputPath,
+		CMSPath:    cmsPath,
+	}); err != nil {
+		t.Fatalf("Embed with custom placeholder: %v", err)
+	}
+}
+
+// TestPrepareRejectsOutOfRangePlaceholderSize locks the validation path so a
+// typoed --placeholder-size value (e.g. 500) fails cleanly rather than
+// emitting a placeholder the finder can't locate.
+func TestPrepareRejectsOutOfRangePlaceholderSize(t *testing.T) {
+	inputPath := createTestPDF(t)
+	_, err := Prepare(PrepareOptions{
+		InputPath:       inputPath,
+		OutputPath:      filepath.Join(t.TempDir(), "prepared.pdf"),
+		SignerName:      "Test User",
+		SigningMethod:   "cmd",
+		SignaturePos:    appearance.DefaultPosition(0),
+		PlaceholderSize: 100, // below MinPlaceholderSize
+	})
+	if err == nil {
+		t.Fatal("expected error for undersized placeholder, got nil")
 	}
 }

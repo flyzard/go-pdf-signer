@@ -1,7 +1,11 @@
 package cli
 
 import (
+	"context"
 	"flag"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/flyzard/pdf-signer/internal/pades"
 )
@@ -25,7 +29,10 @@ func RunFinalize(args []string) {
 		Fatalf("INVALID_ARGS", "missing required flag: --output")
 	}
 
-	result, err := pades.Finalize(pades.FinalizeOptions{
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	result, err := pades.Finalize(ctx, pades.FinalizeOptions{
 		InputPath:  *input,
 		OutputPath: *output,
 		TSAUrl:     *tsaURL,

@@ -1,6 +1,7 @@
 package pades
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,7 +65,7 @@ func TestVerifySignedPDF(t *testing.T) {
 
 	// Finalize to add DSS.
 	finalizedPath := filepath.Join(t.TempDir(), "finalized.pdf")
-	_, err = Finalize(FinalizeOptions{
+	_, err = Finalize(context.Background(), FinalizeOptions{
 		InputPath:  signedPath,
 		OutputPath: finalizedPath,
 	})

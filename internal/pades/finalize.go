@@ -1,11 +1,16 @@
 package pades
 
 import (
+	"context"
 	"crypto/x509"
 	"fmt"
-	"log"
 
 	"github.com/flyzard/pdf-signer/internal/pdf"
+)
+
+// TSA status values surfaced in JSON output.
+const (
+	TSAStatusNotImplemented = "not_implemented"
 )
 
 // FinalizeOptions configures the finalize step.
@@ -17,14 +22,16 @@ type FinalizeOptions struct {
 
 // FinalizeResult contains the output of the finalize step.
 type FinalizeResult struct {
-	LTVStatus string `json:"ltv_status"`
-	Timestamp string `json:"timestamp,omitempty"`
+	LTVStatus string   `json:"ltv_status"`
+	Timestamp string   `json:"timestamp,omitempty"`
+	TSAStatus string   `json:"tsa_status,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 // Finalize reads a signed PDF, collects validation data (certificates, OCSP, CRL),
 // writes a DSS dictionary as an incremental update, and optionally adds a document
 // timestamp.
-func Finalize(opts FinalizeOptions) (*FinalizeResult, error) {
+func Finalize(ctx context.Context, opts FinalizeOptions) (*FinalizeResult, error) {
 	doc, err := pdf.Open(opts.InputPath)
 	if err != nil {
 		return nil, fmt.Errorf("open input PDF: %w", err)
@@ -39,7 +46,7 @@ func Finalize(opts FinalizeOptions) (*FinalizeResult, error) {
 		return nil, fmt.Errorf("no signatures found in PDF")
 	}
 
-	dss, err := CollectValidationData(signerCerts, sigContents)
+	dss, err := CollectValidationData(ctx, signerCerts, sigContents)
 	if err != nil {
 		return nil, fmt.Errorf("collect validation data: %w", err)
 	}
@@ -52,11 +59,13 @@ func Finalize(opts FinalizeOptions) (*FinalizeResult, error) {
 
 	result := &FinalizeResult{
 		LTVStatus: ltvStatus,
+		Warnings:  dss.Warnings,
 	}
 
-	// 7. If TSA URL is provided, log that timestamps are not yet implemented.
 	if opts.TSAUrl != "" {
-		log.Printf("warning: document timestamp not yet implemented (TSA URL: %s)", opts.TSAUrl)
+		result.TSAStatus = TSAStatusNotImplemented
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("document timestamp not yet implemented (TSA URL: %s)", opts.TSAUrl))
 	}
 
 	return result, nil
@@ -92,26 +101,23 @@ func extractSignatureData(doc *pdf.Document) ([]*x509.Certificate, [][]byte, err
 	return signerCerts, sigContents, nil
 }
 
-// determineLTVStatus decides the LTV status based on collected data.
-//   - "valid":   at least one OCSP response AND chain has more than just the leaf cert
-//   - "partial": some validation data present but incomplete
-//   - "none":    no OCSP/CRL data collected
+// determineLTVStatus returns valid only when every signer chain reached a
+// trusted root, some revocation data was collected, and no warning was
+// recorded. Any soft failure drops the result to partial.
 func determineLTVStatus(dss *DSSData, signerCerts []*x509.Certificate) string {
 	if dss == nil {
-		return "none"
+		return LTVStatusNone
 	}
 
 	hasOCSP := len(dss.OCSPs) > 0
 	hasCRL := len(dss.CRLs) > 0
-	hasChainCerts := len(dss.Certs) > len(signerCerts) // More certs than just leaf certs
+	hasChainCerts := len(dss.Certs) > len(signerCerts)
 
-	if hasOCSP && hasChainCerts {
-		return "valid"
+	if dss.ChainsComplete && (hasOCSP || hasCRL) && len(dss.Warnings) == 0 {
+		return LTVStatusValid
 	}
-
 	if hasOCSP || hasCRL || hasChainCerts {
-		return "partial"
+		return LTVStatusPartial
 	}
-
-	return "none"
+	return LTVStatusNone
 }

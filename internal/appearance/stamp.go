@@ -60,7 +60,7 @@ func CreateAppearanceXObject(info SignerInfo, pos Position) (content []byte, dic
 	sb.WriteString("q\n")
 	sb.WriteString("0.8 0.8 0.8 RG\n") // gray stroke
 	sb.WriteString("0.5 w\n")          // line width
-	fmt.Fprintf(&sb, "0 0 %g %g re S\n", pos.Width, pos.Height)
+	fmt.Fprintf(&sb, "0 0 %.4f %.4f re S\n", pos.Width, pos.Height)
 	sb.WriteString("Q\n")
 
 	// Text block with Helvetica 7pt.
@@ -72,22 +72,31 @@ func CreateAppearanceXObject(info SignerInfo, pos Position) (content []byte, dic
 	lineHeight := 10.0
 	startY := pos.Height - 14
 
-	fmt.Fprintf(&sb, "6 %g Td\n", startY)
-	sb.WriteString("(Assinado digitalmente por) Tj\n")
-
-	fmt.Fprintf(&sb, "0 -%g Td\n", lineHeight)
-	fmt.Fprintf(&sb, "(%s) Tj\n", escapePDFString(strings.ToUpper(info.Name)))
-
-	if info.NIC != "" {
-		fmt.Fprintf(&sb, "0 -%g Td\n", lineHeight)
-		fmt.Fprintf(&sb, "(NIC: %s) Tj\n", escapePDFString(info.NIC))
+	// Rough per-line character budget: usable width is box width minus
+	// left+right padding (~12pt), divided by average Helvetica 7pt glyph
+	// width (~3.5pt). Never go below 4 so a tiny box still prints something
+	// sensible.
+	maxChars := int((pos.Width - 12) / 3.5)
+	if maxChars < 4 {
+		maxChars = 4
 	}
 
-	fmt.Fprintf(&sb, "0 -%g Td\n", lineHeight)
-	fmt.Fprintf(&sb, "(Data: %s) Tj\n", escapePDFString(info.DateTime))
+	fmt.Fprintf(&sb, "6 %.4f Td\n", startY)
+	sb.WriteString("(Assinado digitalmente por) Tj\n")
 
-	fmt.Fprintf(&sb, "0 -%g Td\n", lineHeight)
-	fmt.Fprintf(&sb, "(Metodo: %s) Tj\n", escapePDFString(label))
+	fmt.Fprintf(&sb, "0 -%.4f Td\n", lineHeight)
+	fmt.Fprintf(&sb, "(%s) Tj\n", encodePDFString(truncateForStamp(strings.ToUpper(info.Name), maxChars)))
+
+	if info.NIC != "" {
+		fmt.Fprintf(&sb, "0 -%.4f Td\n", lineHeight)
+		fmt.Fprintf(&sb, "(NIC: %s) Tj\n", encodePDFString(truncateForStamp(info.NIC, maxChars-5)))
+	}
+
+	fmt.Fprintf(&sb, "0 -%.4f Td\n", lineHeight)
+	fmt.Fprintf(&sb, "(Data: %s) Tj\n", encodePDFString(info.DateTime))
+
+	fmt.Fprintf(&sb, "0 -%.4f Td\n", lineHeight)
+	fmt.Fprintf(&sb, "(Metodo: %s) Tj\n", encodePDFString(truncateForStamp(label, maxChars-8)))
 
 	sb.WriteString("ET\n")
 
@@ -104,6 +113,7 @@ func CreateAppearanceXObject(info SignerInfo, pos Position) (content []byte, dic
 					"Type":     pdf.Name("Font"),
 					"Subtype":  pdf.Name("Type1"),
 					"BaseFont": pdf.Name("Helvetica"),
+					"Encoding": pdf.Name("WinAnsiEncoding"),
 				},
 			},
 		},
@@ -112,12 +122,65 @@ func CreateAppearanceXObject(info SignerInfo, pos Position) (content []byte, dic
 	return content, dict
 }
 
-// escapePDFString escapes characters that are special in PDF string literals.
-func escapePDFString(s string) string {
-	r := strings.NewReplacer(
-		`\`, `\\`,
-		`(`, `\(`,
-		`)`, `\)`,
-	)
-	return r.Replace(s)
+// truncateForStamp clips s to at most maxChars runes, appending "..." if the
+// clip actually trimmed. Operates on runes so multi-byte names (e.g.
+// Portuguese accents) are cut on rune boundaries, not mid-codepoint.
+func truncateForStamp(s string, maxChars int) string {
+	if maxChars < 1 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxChars {
+		return s
+	}
+	if maxChars <= 3 {
+		return string(runes[:maxChars])
+	}
+	return string(runes[:maxChars-3]) + "..."
 }
+
+// encodePDFString converts a UTF-8 string to a CP1252 (WinAnsi) byte sequence
+// and applies PDF literal-string escaping. Characters that have no CP1252
+// representation are replaced with '?' so we never emit malformed bytes.
+func encodePDFString(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		b, ok := utf8ToCP1252[r]
+		if !ok {
+			b = '?'
+		}
+		switch b {
+		case '(':
+			sb.WriteString(`\(`)
+		case ')':
+			sb.WriteString(`\)`)
+		case '\\':
+			sb.WriteString(`\\`)
+		default:
+			sb.WriteByte(b)
+		}
+	}
+	return sb.String()
+}
+
+// utf8ToCP1252 maps Unicode code points to their CP1252 byte. Built from the
+// Latin-1 range (U+0000..U+00FF, identity mapping) plus the CP1252 0x80..0x9F
+// extensions (Euro sign, smart quotes, etc.).
+var utf8ToCP1252 = func() map[rune]byte {
+	m := make(map[rune]byte, 256)
+	for i := 0; i < 0x80; i++ {
+		m[rune(i)] = byte(i)
+	}
+	for i := 0xA0; i <= 0xFF; i++ {
+		m[rune(i)] = byte(i)
+	}
+	for r, b := range map[rune]byte{
+		'€': 0x80, '‚': 0x82, 'ƒ': 0x83, '„': 0x84, '…': 0x85, '†': 0x86, '‡': 0x87,
+		'ˆ': 0x88, '‰': 0x89, 'Š': 0x8A, '‹': 0x8B, 'Œ': 0x8C, 'Ž': 0x8E,
+		'‘': 0x91, '’': 0x92, '“': 0x93, '”': 0x94, '•': 0x95, '–': 0x96, '—': 0x97,
+		'˜': 0x98, '™': 0x99, 'š': 0x9A, '›': 0x9B, 'œ': 0x9C, 'ž': 0x9E, 'Ÿ': 0x9F,
+	} {
+		m[r] = b
+	}
+	return m
+}()
